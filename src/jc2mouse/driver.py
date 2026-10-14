@@ -150,9 +150,6 @@ LBTN_SL     = 0x20
 LBTN_L      = 0x40
 LBTN_ZL     = 0x80
 
-# Left mode toggle: hold L+ZL (seconds)
-LEFT_MODE_TOGGLE_HOLD_S = 1.2
-
 
 
 def _unwrap(v):
@@ -213,16 +210,10 @@ class JC2OpticalMouse:
         self._stick_base_idx = STICK_BASE_RIGHT  # default until we detect side
 
 
-        # Left has no C button; use L+ZL hold for mode toggle
-        self._left_hold_start = 0.0
-        self._left_hold_latched = False
+        # mode toggle disabled: gamepad-only build, L/ZL and C are normal inputs
 
-        self._left_toggle_hold_active = False
-
-
-        # mode: "mouse" or "gamepad"
-        self.mode = "mouse"
-        self._prev_mode_btn = False
+        # mode: "mouse" or "gamepad" (this build always stays in gamepad mode)
+        self.mode = "gamepad"
 
         # bringup / re-init serialization
         self._bringup_lock = asyncio.Lock()
@@ -295,6 +286,8 @@ class JC2OpticalMouse:
             "west": False,
             "tl": False,
             "tr": False,
+            "tl2": False,
+            "tr2": False,
             "select": False,
             "start": False,
             "mode": False,
@@ -361,6 +354,7 @@ class JC2OpticalMouse:
                 e.EV_KEY: [
                     e.BTN_SOUTH, e.BTN_EAST, e.BTN_NORTH, e.BTN_WEST,
                     e.BTN_TL, e.BTN_TR,
+                    getattr(e, "BTN_TL2", e.BTN_TL), getattr(e, "BTN_TR2", e.BTN_TR),
                     e.BTN_SELECT, e.BTN_START, e.BTN_MODE, e.BTN_THUMBL,
                     e.BTN_DPAD_UP, e.BTN_DPAD_DOWN, e.BTN_DPAD_LEFT, e.BTN_DPAD_RIGHT,
                 ],
@@ -1092,36 +1086,8 @@ class JC2OpticalMouse:
             self._last_raw_b5 = data[5]
 
         # --- Mode toggle ---
-        if self.side != "left":
-            # Right JC2: C button edge toggle (uses misc byte)
-            mode_btn = self._btn_misc(data, BTN_C)
-            if mode_btn and not self._prev_mode_btn:
-                self._set_mode("gamepad" if self.mode == "mouse" else "mouse")
-                if self.mode == "gamepad":
-                    self._last_opt_active_ts = now
-            self._prev_mode_btn = mode_btn
-
-        else:
-            # Left JC2: hold L + ZL to toggle (avoids stealing SL/SR)
-            hold = self._btn_face(data, LBTN_L) and self._btn_face(data, LBTN_ZL)
-
-            self._left_toggle_hold_active = hold
-
-            if not hold:
-                self._left_toggle_hold_active = False
-
-            if hold and not self._left_hold_latched:
-                if self._left_hold_start == 0.0:
-                    self._left_hold_start = now
-                elif (now - self._left_hold_start) >= LEFT_MODE_TOGGLE_HOLD_S:
-                    self._left_hold_latched = True
-                    self._set_mode("gamepad" if self.mode == "mouse" else "mouse")
-                    if self.mode == "gamepad":
-                        self._last_opt_active_ts = now
-
-            if not hold:
-                self._left_hold_start = 0.0
-                self._left_hold_latched = False
+        # Disabled: this build is gamepad-only. L/ZL (Left) and C (Right)
+        # are passed through as normal gamepad inputs below.
 
 
         # --- Stick decode ---
@@ -1215,14 +1181,19 @@ class JC2OpticalMouse:
                 if COMPAT_SWAP_WEST_NORTH:
                     gp_west, gp_north = gp_north, gp_west
 
-                # shoulders: SL/SR -> LB/RB
-                gp_tl = sl
-                gp_tr = sr
+                # shoulders: SL/SR -> LB/RB, R/ZR -> LT/RT
+                gp_tl  = sl
+                gp_tr  = sr
+                gp_tl2 = sh
+                gp_tr2 = tr
 
                 # + and HOME mapping
                 plus = btn_pressed(data, BTN5, BTN_PLUS)
                 gp_start  = plus        # +    -> START
                 gp_select = home        # HOME -> SELECT/BACK
+
+                # C -> GUIDE (no longer a mode toggle)
+                gp_mode = btn_pressed(data, BTN5, BTN_C)
 
                 # optional: R3 -> THUMBL
                 gp_thumb = r3
@@ -1239,8 +1210,11 @@ class JC2OpticalMouse:
                 emit_btn(e.BTN_NORTH,  "north",  gp_north)
                 emit_btn(e.BTN_TL,     "tl",     gp_tl)
                 emit_btn(e.BTN_TR,     "tr",     gp_tr)
+                emit_btn(getattr(e, "BTN_TL2", e.BTN_TL), "tl2", gp_tl2)
+                emit_btn(getattr(e, "BTN_TR2", e.BTN_TR), "tr2", gp_tr2)
                 emit_btn(e.BTN_SELECT, "select", gp_select)
                 emit_btn(e.BTN_START,  "start",  gp_start)
+                emit_btn(e.BTN_MODE,   "mode",   gp_mode)
                 emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
 
                 self.ui_pad.syn()
@@ -1268,14 +1242,8 @@ class JC2OpticalMouse:
                 #   L  -> left click
                 #   ZL -> right click
                 #   L3 -> middle click
-                # Suppress clicks while holding L+ZL to toggle modes
-                if self._left_toggle_hold_active:
-                    left = False
-                    right = False
-                else:
-                    left = l
-                    right = zl
-
+                left = l
+                right = zl
                 middle = l3
 
 
@@ -1323,9 +1291,11 @@ class JC2OpticalMouse:
                 if LCOMPAT_SWAP_WEST_NORTH:
                     gp_west, gp_north = gp_north, gp_west
 
-                # SL/SR should act as LB/RB in horizontal mode
-                gp_tl = sl
-                gp_tr = sr
+                # SL/SR should act as LB/RB in horizontal mode; L/ZL -> LT/RT
+                gp_tl  = sl
+                gp_tr  = sr
+                gp_tl2 = l
+                gp_tr2 = zl
 
                 # Start/Select
                 gp_select = minus
@@ -1333,9 +1303,6 @@ class JC2OpticalMouse:
 
                 # Stick click
                 gp_thumb = l3
-
-                # L/ZL are reserved for mode-toggle chord; do not emit them in gamepad mode.
-                # (No mapping here by design.)
 
                 def emit_btn(keycode, name, pressed):
                     prev = self._gp_prev[name]
@@ -1350,6 +1317,8 @@ class JC2OpticalMouse:
 
                 emit_btn(e.BTN_TL,     "tl",     gp_tl)
                 emit_btn(e.BTN_TR,     "tr",     gp_tr)
+                emit_btn(getattr(e, "BTN_TL2", e.BTN_TL), "tl2", gp_tl2)
+                emit_btn(getattr(e, "BTN_TR2", e.BTN_TR), "tr2", gp_tr2)
                 emit_btn(e.BTN_SELECT, "select", gp_select)
                 emit_btn(e.BTN_START,  "start",  gp_start)
                 emit_btn(e.BTN_THUMBL, "thumb",  gp_thumb)
@@ -1535,13 +1504,7 @@ async def run(mac: str, *, status: bool = True, status_hz: float = 5.0, verbose:
             await drv.start()
             await drv.start_motion_pump()
 
-            _stderr("[jc2] Driver active.")
-            if drv.side == "left":
-                _stderr("[jc2] Tip: hold L+ZL to toggle mouse/gamepad mode.")
-            elif drv.side == "right":
-                _stderr("[jc2] Tip: press C to toggle mouse/gamepad mode.")
-            else:
-                _stderr("[jc2] Tip: Right uses C; Left uses hold L+ZL to toggle mouse/gamepad mode.")
+            _stderr("[jc2] Driver active. Gamepad-only build: mouse-mode toggle is disabled.")
 
             last_print = 0.0
             last_count = 0
